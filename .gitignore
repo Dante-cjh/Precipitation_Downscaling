@@ -1,0 +1,5 @@
+processed_datasets/
+logs/
+./models/
+predictions/
+.idea/
