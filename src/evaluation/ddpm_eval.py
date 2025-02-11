@@ -144,7 +144,7 @@ if __name__ == "__main__":
             return new_state_dict
 
         fixed_state_dict = fix_state_dict_keys(state_dict)
-        model.load_state_dict(fixed_state_dict)
+        model.load_state_dict(state_dict)
         model.eval()  # 确保模型进入评估模式
         sample_function = lambda batch, model, device, dataset, num_steps=100: sample_diffusion(batch, model, device, dataset, num_steps=num_steps)
         num_steps = 100
