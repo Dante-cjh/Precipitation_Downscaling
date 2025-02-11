@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -9,6 +10,19 @@ from torchmetrics.functional import peak_signal_noise_ratio, structural_similari
 from src.dataset.ddpm_dataset import RobustPrecipitationDataModule
 from src.models import Network
 
+class SaveEveryNEpochs(pl.callbacks.Callback):
+    def __init__(self, save_dir, save_every_n_epochs=20):
+        self.save_dir = save_dir
+        self.save_every_n_epochs = save_every_n_epochs
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.save_every_n_epochs == 0:
+            save_path = os.path.join(self.save_dir, f"model_epoch_{epoch + 1}.pt")
+            # 保存内部模型的 state_dict 而非整个 LightningModule 的 state_dict
+            torch.save(pl_module.model.state_dict(), save_path)
+            print(f"Model saved at epoch {epoch + 1} to {save_path}")
 
 # =============================================================================
 # 定义 LightningModule：封装 UNet 的训练、验证及采样逻辑
@@ -84,7 +98,11 @@ class UnetLightningModule(pl.LightningModule):
 
         mse_val  = F.mse_loss(output, image_target)
         psnr_val = peak_signal_noise_ratio(output, image_target, data_range=dynamic_range)
-        ssim_val = structural_similarity_index_measure(output, image_target, data_range=dynamic_range)
+
+        dr = (image_target.max() - image_target.min()).item()
+        if dr < 1e-6:
+            dr = 1e-6
+        ssim_val = structural_similarity_index_measure(output, image_target, data_range=dr)
 
         self.log("val_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         self.log("val_mse", mse_val, prog_bar=True, on_step=True, on_epoch=True)
@@ -138,7 +156,7 @@ class UnetLightningModule(pl.LightningModule):
 
 
 # =============================================================================
-# 主函数：使用 Lightning Trainer 进行训练，并添加 EarlyStopping 回调（patience=20）
+# 主函数：使用 Lightning Trainer 进行训练，并添加 EarlyStopping 回调（patience=10）
 # =============================================================================
 if __name__ == "__main__":
     batch_size = 8
@@ -153,12 +171,13 @@ if __name__ == "__main__":
     model = UnetLightningModule(learning_rate=3e-5)
 
     # EarlyStopping 回调：监控 "val_loss"，patience 设为 20
-    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=20, mode="min")
+    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=10, mode="min")
     checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", mode="min")
+    save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet/", save_every_n_epochs=20)
 
     trainer = pl.Trainer(
         max_epochs=num_epochs,
-        callbacks=[early_stop_callback, checkpoint_callback],
+        callbacks=[early_stop_callback, checkpoint_callback, save_every_n_epochs_callback],
         precision="16-mixed",       # 混合精度训练
         accumulate_grad_batches=8,
         log_every_n_steps=10,
@@ -169,5 +188,5 @@ if __name__ == "__main__":
     # 保存最佳模型
     best_model_path = checkpoint_callback.best_model_path
     if best_model_path:
-        model = UnetLightningModule.load_from_checkpoint(best_model_path)
-        torch.save(model.state_dict(), "../models/unet/best_model.pt")
+        best_model = UnetLightningModule.load_from_checkpoint(best_model_path)
+        torch.save(best_model.model.state_dict(), "../models/unet/best_model.pt")
