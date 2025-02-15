@@ -71,7 +71,7 @@ def main():
     model_conf["small_size"] = small_size
     model_conf["num_channels"] = 128
     model_conf["num_res_blocks"] = 2
-    model_conf["diffusion_steps"] = 1000
+    model_conf["diffusion_steps"] = 4000
     model_conf["noise_schedule"] = "linear"
     model_conf["learn_sigma"] = True
     model_conf["class_cond"] = False
@@ -155,17 +155,17 @@ def main():
     # =========== 12. 训练结束后，可选地测试一下 ===========
     print("[main] Training complete. Now testing best model if needed ...")
     # 载入最优模型
-    # if checkpoint_callback.best_model_path:
-    #     best_ckpt = checkpoint_callback.best_model_path
-    #     best_model = DDPM.load_from_checkpoint(best_ckpt, model=model, diffusion=diffusion, lr=lr,
-    #                                            ema_rate=ema_rate,
-    #                                            schedule_sampler=None,
-    #                                            weight_decay=0.0,
-    #                                            model_dir="checkpoints")
-    #     trainer.test(best_model, datamodule=data_module)
-    #     # 手动再保存一份 best model 的权重
-    #     torch.save(best_model.model.state_dict(), os.path.join(model_dir, "best_model.pt"))
-    #     print(f"[main] Best model saved to {os.path.join(model_dir, 'best_model.pt')}")
+    if checkpoint_callback.best_model_path:
+        best_ckpt = checkpoint_callback.best_model_path
+        best_model = DDPM.load_from_checkpoint(best_ckpt, model=model, diffusion=diffusion, lr=lr,
+                                               ema_rate=ema_rate,
+                                               schedule_sampler=None,
+                                               weight_decay=0.0,
+                                               model_dir="checkpoints")
+        trainer.test(best_model, datamodule=data_module)
+        # 手动再保存一份 best model 的权重
+        torch.save(best_model.model.state_dict(), os.path.join(model_dir, "best_model.pt"))
+        print(f"[main] Best model saved to {os.path.join(model_dir, 'best_model.pt')}")
 
 if __name__ == "__main__":
     # 可选：设置矩阵乘法精度

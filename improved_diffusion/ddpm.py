@@ -228,9 +228,9 @@ class DDPM(pl.LightningModule):
         def save_checkpoint(rate, params):
             state_dict = self._master_params_to_state_dict(params)
             if not rate:
-                filename = f"model{(self.global_step):06d}.pt"
+                filename = f"model{(self.current_epoch):06d}.pt"
             else:
-                filename = f"ema_{rate}_{(self.global_step):06d}.pt"
+                filename = f"ema_{rate}_{(self.current_epoch):06d}.pt"
             with bf.BlobFile(bf.join(self.get_blob_logdir(), filename), "wb") as f:
                 torch.save(state_dict, f)
 
