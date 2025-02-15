@@ -73,14 +73,14 @@ class UnetLightningModule(pl.LightningModule):
         loss = loss.mean()
 
         self.train_loss_accum.append(loss.detach())
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.train_mse.update(output, image_target)
         return loss
 
     def on_train_epoch_end(self):
         if self.train_loss_accum:
             epoch_loss = sum(self.train_loss_accum) / len(self.train_loss_accum)
-            self.log("train_epoch_loss", epoch_loss, prog_bar=True)
+            self.log("train_epoch_loss", epoch_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.train_loss_accum = []
 
     def validation_step(self, batch, batch_idx):
@@ -104,10 +104,10 @@ class UnetLightningModule(pl.LightningModule):
             dr = 1e-6
         ssim_val = structural_similarity_index_measure(output, image_target, data_range=dr)
 
-        self.log("val_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val_mse", mse_val, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val_psnr", psnr_val, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val_ssim", ssim_val, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_mse", mse_val, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_psnr", psnr_val, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_ssim", ssim_val, prog_bar=True, on_step=False, on_epoch=True)
 
         # 累积每个 validation step 的输出，用于 epoch 结束后计算聚合指标
         if not hasattr(self, "_val_outputs"):
@@ -120,7 +120,7 @@ class UnetLightningModule(pl.LightningModule):
             all_preds = torch.cat([x["pred"] for x in self._val_outputs], dim=0)
             all_targets = torch.cat([x["target"] for x in self._val_outputs], dim=0)
             overall_mse = F.mse_loss(all_preds, all_targets)
-            self.log("epoch_val_mse", overall_mse, prog_bar=True)
+            self.log("epoch_val_mse", overall_mse, prog_bar=True, on_step=False, on_epoch=True)
             self._val_outputs = []
 
     def configure_optimizers(self):
@@ -171,7 +171,7 @@ if __name__ == "__main__":
     model = UnetLightningModule(learning_rate=3e-5)
 
     # EarlyStopping 回调：监控 "val_loss"，patience 设为 20
-    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=20, mode="min")
     checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", mode="min")
     save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet/", save_every_n_epochs=20)
 
