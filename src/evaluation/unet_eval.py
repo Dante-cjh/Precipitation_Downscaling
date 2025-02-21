@@ -1,6 +1,5 @@
 import os
 import torch
-from fairseq.logging.metrics import state_dict
 from torch.utils.data import DataLoader
 import numpy as np
 import cv2
