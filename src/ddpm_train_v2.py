@@ -5,6 +5,7 @@ from torch.optim import AdamW
 import pytorch_lightning as pl
 import torchmetrics
 from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from src.dataset.ddpm_dataset_v2 import RobustPrecipitationDataModule
 from src.models import NetworkV2
 
@@ -140,7 +141,6 @@ class DiffusionLightningModule(pl.LightningModule):
         # batch 中包含 "inputs" (7 通道条件数据) 和 "targets" (1 通道标准化后的残差)
         # 准备输入并计算损失
         inputs = self._prepare_inputs(batch)
-        meteo_conditions = None
         meteo_conditions = self._prepare_meteo_conditions(batch)
         loss = self.loss_fn(
             net=self.model,
@@ -208,7 +208,15 @@ class DiffusionLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.learning_rate)
-        return optimizer
+
+        # Add ReduceLROnPlateau scheduler
+        lr_scheduler = {
+            'scheduler': ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10, verbose=True),
+            'monitor': 'val_loss',
+            'frequency': 1
+        }
+
+        return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
 
     def _get_pred(self, image_input, image_target):
         """
@@ -237,20 +245,23 @@ if __name__ == "__main__":
     residual_mean = 0.0020228675566613674
     residual_std = 6.931405067443848
 
-    dm = RobustPrecipitationDataModule(train_dir, val_dir, test_dir, batch_size=4,
+    dm = RobustPrecipitationDataModule(train_dir, val_dir, test_dir, batch_size=8,
                                        norm_means=norm_means, norm_stds=norm_stds, residual_mean=residual_mean, residual_std=residual_std)
 
     model = DiffusionLightningModule(learning_rate=1e-4, residual_mean=residual_mean, residual_std=residual_std)
 
     # EarlyStopping 回调（监控 "val_loss"，patience 设为 10）
-    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=10, mode="min")
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", mode="min")
+    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_psnr", patience=20, mode="max")
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_psnr", mode="max")
     save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet_diffusion/", save_every_n_epochs=20)
+
+    # Learning rate scheduler and monitor
+    lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
 
     trainer = pl.Trainer(
         max_epochs=1000,
-        callbacks=[early_stop_callback, checkpoint_callback, save_every_n_epochs_callback],
-        precision="16-mixed",                      # 使用 16-mixed 精度
+        callbacks=[early_stop_callback, checkpoint_callback, save_every_n_epochs_callback, lr_monitor],
+        precision="16-mixed",
         accumulate_grad_batches=8,
         log_every_n_steps=10,
         default_root_dir="../logs/unet_diffusion/"
@@ -262,4 +273,3 @@ if __name__ == "__main__":
     if best_model_path:
         best_model = DiffusionLightningModule.load_from_checkpoint(best_model_path)
         torch.save(best_model.model.state_dict(), "../models/unet_diffusion/best_model.pt")
-
