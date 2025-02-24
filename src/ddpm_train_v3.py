@@ -5,6 +5,7 @@ from torch.optim import AdamW
 import pytorch_lightning as pl
 import torchmetrics
 from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from src.dataset.ddpm_dataset import RobustPrecipitationDataModule
 from src.models import NetworkV3
 
@@ -148,7 +149,15 @@ class DiffusionLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.learning_rate)
-        return optimizer
+
+        # Add ReduceLROnPlateau scheduler
+        lr_scheduler = {
+            'scheduler': ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5, verbose=True),
+            'monitor': 'val_loss',
+            'frequency': 1
+        }
+
+        return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
 
     def _get_pred(self, image_input, image_target):
         """
@@ -171,11 +180,21 @@ if __name__ == "__main__":
     val_dir   = "../processed_datasets/new_val"
     test_dir  = "../processed_datasets/new_test"
 
-    dm = RobustPrecipitationDataModule(train_dir, val_dir, test_dir, batch_size=8)
+    # 如果你预先计算了归一化参数，可以将它们传入数据集构造函数
+    norm_means = {'acpcp': 10.540719985961914, 'lsm': 0.31139194936462644, 'r2': 76.87171173095703,
+                  't': 281.4097900390625, 'u10': 0.6429771780967712, 'v10': -0.13687361776828766,
+                  'z': 2719.8411298253704}
+    norm_stds = {'acpcp': 24.950708389282227, 'lsm': 0.44974926605736953, 'r2': 17.958908081054688,
+                 't': 18.581451416015625, 'u10': 5.890835762023926, 'v10': 4.902953624725342, 'z': 6865.68850114493}
+    residual_mean = 0.0020228675566613674
+    residual_std = 6.931405067443848
+
+    dm = RobustPrecipitationDataModule(train_dir, val_dir, test_dir, batch_size=8,
+                                       norm_means=norm_means, norm_stds=norm_stds, residual_mean=residual_mean, residual_std=residual_std)
     model = DiffusionLightningModule(learning_rate=1e-4)
 
     # EarlyStopping 回调（监控 "val_loss"，patience 设为 10）
-    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=20, mode="min")
     checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", mode="min")
     save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet_diffusion_v3/", save_every_n_epochs=20)
 

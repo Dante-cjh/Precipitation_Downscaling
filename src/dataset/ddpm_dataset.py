@@ -59,7 +59,6 @@ class RobustPrecipitationZScoreDataset(Dataset):
             self.residual_mean = residual_mean
             self.residual_std = residual_std
 
-
         self.inverse_normalize_residual = lambda residual_norm: ((residual_norm * self.residual_std) +
                                                                  self.residual_mean)
 
@@ -205,7 +204,8 @@ class RobustPrecipitationZScoreDataset(Dataset):
 
 
 class RobustPrecipitationDataModule(LightningDataModule):
-    def __init__(self, train_dir, val_dir, test_dir, batch_size=8):
+    def __init__(self, train_dir, val_dir, test_dir, batch_size=8,
+                 norm_means=None, norm_stds=None, residual_mean=None, residual_std=None):
         """
         Args:
             train_dir, val_dir, test_dir: 分别为训练、验证和测试数据所在目录，
@@ -217,12 +217,25 @@ class RobustPrecipitationDataModule(LightningDataModule):
         self.val_dir = val_dir
         self.test_dir = test_dir
         self.batch_size = batch_size
+        self.norm_means = norm_means
+        self.norm_stds = norm_stds
+        self.residual_mean = residual_mean
+        self.residual_std = residual_std
 
     def setup(self, stage=None):
         # 请确保 robust_precipitation_dataset.py 文件中包含 RobustPrecipitationZScoreDataset 类
-        self.train_dataset = RobustPrecipitationZScoreDataset(self.train_dir)
-        self.val_dataset = RobustPrecipitationZScoreDataset(self.val_dir)
-        self.test_dataset = RobustPrecipitationZScoreDataset(self.test_dir)
+        self.train_dataset = RobustPrecipitationZScoreDataset(self.train_dir, normalize=True,
+                                                              norm_stds=self.norm_stds, norm_means=self.norm_means,
+                                                              residual_mean=self.residual_mean,
+                                                              residual_std=self.residual_std)
+        self.val_dataset = RobustPrecipitationZScoreDataset(self.val_dir, normalize=True,
+                                                            norm_stds=self.norm_stds, norm_means=self.norm_means,
+                                                            residual_mean=self.residual_mean,
+                                                            residual_std=self.residual_std)
+        self.test_dataset = RobustPrecipitationZScoreDataset(self.test_dir, normalize=True,
+                                                             norm_stds=self.norm_stds, norm_means=self.norm_means,
+                                                             residual_mean=self.residual_mean,
+                                                             residual_std=self.residual_std)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset,

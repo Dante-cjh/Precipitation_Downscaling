@@ -211,7 +211,7 @@ class DiffusionLightningModule(pl.LightningModule):
 
         # Add ReduceLROnPlateau scheduler
         lr_scheduler = {
-            'scheduler': ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10, verbose=True),
+            'scheduler': ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5, verbose=True),
             'monitor': 'val_loss',
             'frequency': 1
         }
