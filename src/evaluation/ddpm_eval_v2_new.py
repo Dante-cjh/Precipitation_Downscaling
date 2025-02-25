@@ -200,8 +200,6 @@ if __name__ == "__main__":
             coarse = batch["coarse_acpcp"]
             fine = batch["fine_acpcp"]
             return coarse, fine, coarse
-
-
         model = None
         num_steps = None
         rngs = [""]
