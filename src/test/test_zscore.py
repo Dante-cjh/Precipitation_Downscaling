@@ -31,5 +31,5 @@ def test_residual_to_fine_image(data_dir):
 
 
 if __name__ == "__main__":
-    data_dir = "../processed_datasets/new_test/"
+    data_dir = "../../processed_datasets/new_test/"
     test_residual_to_fine_image(data_dir)

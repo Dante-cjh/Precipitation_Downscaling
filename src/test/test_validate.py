@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 初始化数据集
-val_data_dir = "../processed_datasets/new_val/"
+val_data_dir = "../../processed_datasets/new_val/"
 val_dataset = PrecipitationDatasetCGAN(data_dir=val_data_dir, input_size=(28, 28), target_size=(224, 224),
                                        upscale_factor=8, in_depth=1, cvars=['r2', 't', 'u10', 'v10', 'lsm'],
                                        log_transform=False)
@@ -25,10 +25,10 @@ generator = generator.to(device)
 generator.load_state_dict(torch.load("../models/encoded_cgan_output/generator_epoch_100.pth"))
 
 # 初始化 Tensorboard
-writer = SummaryWriter(log_dir="../logs/encoded_cgan/")
+writer = SummaryWriter(log_dir="../../logs/encoded_cgan/")
 
 # 调用验证函数
-validate(generator, val_dataset, device, epoch=100, log_transform=False, output_dir="../models/encoded_cgan_output/", writer=writer)
+validate(generator, val_dataset, device, epoch=100, log_transform=False, output_dir="../../models/encoded_cgan_output/", writer=writer)
 
 # 关闭 Tensorboard
 writer.close()

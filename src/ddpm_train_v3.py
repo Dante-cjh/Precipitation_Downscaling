@@ -21,7 +21,6 @@ class SaveEveryNEpochs(pl.callbacks.Callback):
             save_path = os.path.join(self.save_dir, f"model_epoch_{epoch + 1}.pt")
             # 保存内部模型的 state_dict 而非整个 LightningModule 的 state_dict
             torch.save(pl_module.model.state_dict(), save_path)
-            print(f"Model saved at epoch {epoch + 1} to {save_path}")
 
 
 # =============================================================================
