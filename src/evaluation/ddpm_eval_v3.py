@@ -13,7 +13,7 @@ from src.dataset.ddpm_dataset import RobustPrecipitationZScoreDataset
 
 
 # --------------------------
-# 计算二值指标函数（PC, PO, FAR）
+# 计算二值指标函数（PC, PO, FAR, PD, HSS）
 def calculate_metrics(pred, target, threshold=0.1):
     pred_binary = (pred > threshold).astype(int)
     target_binary = (target > threshold).astype(int)
