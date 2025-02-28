@@ -3,3 +3,4 @@ logs/
 /models/
 predictions/
 .idea/
+/processed_datasets.zip
