@@ -66,11 +66,6 @@ for t in tqdm(range(ntime)):
     fine_img = fine[t]
     predicted_img = predicted[t]
 
-    # # 归一化到 [0, 1] 范围
-    # coarse_img_norm = (coarse_img - coarse_img.min()) / (coarse_img.max() - coarse_img.min())
-    # fine_img_norm = (fine_img - fine_img.min()) / (fine_img.max() - fine_img.min())
-    # predicted_img_norm = (predicted_img - predicted_img.min()) / (predicted_img.max() - predicted_img.min())
-
     # 获取实际数据的最小值和最大值
     data_min = min(coarse_img.min(), fine_img.min(), predicted_img.min())
     data_max = max(coarse_img.max(), fine_img.max(), predicted_img.max())

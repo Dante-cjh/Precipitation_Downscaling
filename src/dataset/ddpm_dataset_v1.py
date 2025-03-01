@@ -62,6 +62,48 @@ class RobustPrecipitationZScoreDataset(Dataset):
         self.inverse_normalize_residual = lambda residual_norm: ((residual_norm * self.residual_std) +
                                                                  self.residual_mean)
 
+        # 预先处理并缓存所有样本
+        self.samples = []
+        for file in self.file_list:
+            sample = self._process_file(file)
+            self.samples.append(sample)
+
+    def _process_file(self, file_path):
+        ds = xr.open_dataset(file_path)
+        data = {}
+        # 读取并处理变量
+        for var in self.variables:
+            arr = ds[var].values
+            arr = np.nan_to_num(arr, nan=0.0)
+            if var == "acpcp":
+                arr = np.clip(arr, 0, 999)
+            data[var] = torch.tensor(arr, dtype=torch.float32).unsqueeze(0)
+        ds.close()
+
+        # 处理acpcp生成coarse和残差
+        fine_acpcp = data["acpcp"]
+        fine_unsq = fine_acpcp.unsqueeze(0)
+        downsampled = F.interpolate(fine_unsq, self.input_size, mode="bicubic", align_corners=False)
+        coarse_acpcp = F.interpolate(downsampled, self.target_size, mode="bicubic", align_corners=False).squeeze(0)
+        residual_acpcp = fine_acpcp - coarse_acpcp
+
+        # 标准化
+        if self.normalize:
+            coarse_norm = self._zscore(coarse_acpcp, self.norm_means["acpcp"], self.norm_stds["acpcp"])
+            residual_norm = self._zscore(residual_acpcp, self.residual_mean, self.residual_std)
+        else:
+            coarse_norm = coarse_acpcp
+            residual_norm = residual_acpcp
+
+
+        return {
+            "inputs": coarse_norm,
+            "targets": residual_norm,
+            "fine_acpcp": fine_acpcp,
+            "coarse_acpcp": coarse_acpcp
+        }
+
+
     def _compute_normalization_params(self):
         """
         遍历所有文件，计算各变量及 acpcp 残差的均值与标准差。
@@ -116,72 +158,7 @@ class RobustPrecipitationZScoreDataset(Dataset):
         return len(self.file_list)
 
     def __getitem__(self, idx):
-        file_path = self.file_list[idx]
-        ds = xr.open_dataset(file_path)
-
-        # 读取所有变量，均假设 shape 为 (224,224)，并转换为 tensor（添加 channel 维度）
-        data = {}
-        for var in self.variables:
-            if var not in ds:
-                ds.close()
-                raise ValueError(f"文件 {file_path} 缺少变量 {var}")
-            arr = ds[var].values
-            arr = np.nan_to_num(arr, nan=0.0)
-            if var == "acpcp":
-                # 异常值处理：clip 到 [0, 999]
-                arr = np.clip(arr, 0, 999)
-            data[var] = torch.tensor(arr, dtype=torch.float32).unsqueeze(0)
-        ds.close()
-
-        # ----- 针对 acpcp（降水）处理 -----
-        # 原始高分辨率降水图像（未标准化）：shape (1,224,224)
-        fine_acpcp = data["acpcp"]
-        # 生成低分辨率版本：先下采样到 input_size，再上采样到 target_size（均为 224×224）
-        fine_unsq = fine_acpcp.unsqueeze(0)  # shape (1,1,224,224)
-        downsampled = F.interpolate(fine_unsq, size=self.input_size, mode="bicubic", align_corners=False)
-        coarse_acpcp = F.interpolate(downsampled, size=self.target_size, mode="bicubic", align_corners=False)
-        coarse_acpcp = coarse_acpcp.squeeze(0)  # shape (1,224,224)
-
-        # 计算残差
-        residual_acpcp = fine_acpcp - coarse_acpcp
-
-        if self.normalize:
-            # 对 acpcp 的 coarse 做 Z-Score 标准化（使用计算得到的参数）
-            coarse_norm_acpcp = self._zscore(coarse_acpcp, self.norm_means["acpcp"], self.norm_stds["acpcp"])
-            # 计算残差（在原始空间），再用残差的参数进行标准化
-            residual_norm = self._zscore(residual_acpcp, self.residual_mean, self.residual_std)
-        else:
-            coarse_norm_acpcp = coarse_acpcp
-            residual_norm = residual_acpcp
-
-        # ----- 其它变量处理（r2, t, u10, v10, lsm, z） -----
-        other_vars_norm = {}
-        for var in self.variables:
-            if var == "acpcp":
-                continue  # 已处理
-            if self.normalize:
-                other_vars_norm[var] = self._zscore(data[var], self.norm_means[var], self.norm_stds[var])
-            else:
-                other_vars_norm[var] = data[var]
-
-            # 检查变量的 shape，如果不是 (a, a, a)，则 reshape 为 (a, a, a)
-            if other_vars_norm[var].ndimension() != 3:
-                other_vars_norm[var] = other_vars_norm[var].squeeze(0)
-
-
-        # 返回的字典中包含：
-        #   "inputs"       : 模型输入（低分辨率 norm_acpcp ，仅 1 通道）
-        #   "targets"      : acpcp 残差（标准化后），shape (1,224,224)
-        #   "fine_acpcp"   : 标准化后的高分辨率 acpcp（可用于可视化）
-        #   "coarse_acpcp" : 标准化后的低分辨率 acpcp (用于后续对比)
-        #   其它变量也一并返回（标准化后）
-        sample = {
-            "inputs": coarse_norm_acpcp,
-            "targets": residual_norm,
-            "fine_acpcp": fine_acpcp,
-            "coarse_acpcp": coarse_acpcp
-        }
-        return sample
+        return self.samples[idx]
 
     def residual_to_fine_image(self, residual, coarse_image):
         return coarse_image + self.inverse_normalize_residual(residual)
