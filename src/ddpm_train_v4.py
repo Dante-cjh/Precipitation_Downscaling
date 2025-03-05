@@ -7,7 +7,7 @@ import torchmetrics
 from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from src.dataset.ddpm_dataset_v2 import RobustPrecipitationDataModule
-from src.models import NetworkV2
+from src.models import NetworkV4
 
 class SaveEveryNEpochs(pl.callbacks.Callback):
     def __init__(self, save_dir, save_every_n_epochs=20):
@@ -91,12 +91,14 @@ class DiffusionLightningModule(pl.LightningModule):
 
         # 初始化模型（模型代码在 Network 模块中）
         # 注意：img_resolution 为 (224, 224)，in_channels=8 （7个条件通道+1个目标残差通道作为条件输入）
-        self.model = NetworkV2.EDMPrecond(
+        self.model = NetworkV4.EDMPrecond(
             img_resolution=(224, 224),
             in_channels=8,  # 7 通道条件数据 + 1 通道降水残差（作为条件输入）
             out_channels=1,
             use_meteo_attn=True,
-            meteo_emb_dim=256
+            meteo_emb_dim=256,
+            use_cam=True,
+            use_sam=True
         )
 
         # 损失函数
@@ -162,9 +164,8 @@ class DiffusionLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs = self._prepare_inputs(batch)
-        meteo_conditions=self._prepare_meteo_conditions(batch)
         # 使用模型预测
-        pred = self._get_pred(inputs, batch['target'], meteo_conditions=meteo_conditions)
+        pred = self._get_pred(inputs, batch['target'])
 
         # 获取标准化后的真实图像
         fine_true = batch["metadata"]["fine_precip"]
@@ -219,7 +220,7 @@ class DiffusionLightningModule(pl.LightningModule):
 
         return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
 
-    def _get_pred(self, image_input, image_target, meteo_conditions):
+    def _get_pred(self, image_input, image_target):
         """
         模拟采样过程：生成噪声尺度 sigma，再对 (target+n) 调用模型得到预测结果。
         """
@@ -227,7 +228,7 @@ class DiffusionLightningModule(pl.LightningModule):
         sigma = (rnd_normal * self.loss_fn.P_std + self.loss_fn.P_mean).exp()
         y = image_target  # 使用真实目标
         n = torch.randn_like(y) * sigma  # 添加噪声
-        D_yn = self.model(y + n, sigma, image_input, meteo_conditions=meteo_conditions)  # 前向传播
+        D_yn = self.model(y + n, sigma, image_input, None)  # 前向传播
         return D_yn
 
 
@@ -253,21 +254,19 @@ if __name__ == "__main__":
 
     # EarlyStopping 回调（监控 "val_loss"，patience 设为 10）
     early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=20, mode="min")
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", dirpath="../models/unet_diffusion_v2/", filename='model-{epoch:02d}-{val_loss:.2f}', save_top_k=1, mode="min")
-    save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet_diffusion_v2/", save_every_n_epochs=20)
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", dirpath="../models/unet_diffusion_v1/", filename='model-{epoch:02d}-{val_loss:.2f}', save_top_k=1, mode="min")
+    save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet_diffusion_v4/", save_every_n_epochs=20)
 
     # Learning rate scheduler and monitor
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
 
     trainer = pl.Trainer(
         max_epochs=1000,
-        accelerator="gpu",
-        devices=[0],
         callbacks=[early_stop_callback, checkpoint_callback, save_every_n_epochs_callback, lr_monitor],
         precision="16-mixed",
         accumulate_grad_batches=8,
         log_every_n_steps=10,
-        default_root_dir="../logs/unet_diffusion_v2/"
+        default_root_dir="../logs/unet_diffusion/"
     )
     trainer.fit(model, dm)
 
@@ -275,4 +274,4 @@ if __name__ == "__main__":
     best_model_path = checkpoint_callback.best_model_path
     if best_model_path:
         best_model = DiffusionLightningModule.load_from_checkpoint(best_model_path)
-        torch.save(best_model.model.state_dict(), "../models/unet_diffusion_v2/best_model.pt")
+        torch.save(best_model.model.state_dict(), "../models/unet_diffusion/best_model.pt")

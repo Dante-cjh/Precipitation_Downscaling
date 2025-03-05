@@ -19,7 +19,7 @@ class RobustPrecipitationZScoreDataset(Dataset):
     DYNAMIC_VARS = ["r2", "t", "u10", "v10"]  # 动态气象变量
 
     def __init__(self, data_dir, input_size=(28, 28), target_size=(224, 224), normalize=True,
-                 extreme_threshold=50.0, weight_scale=3.0,
+                 extreme_threshold=99.0, weight_scale=3.0,
                  norm_means=None, norm_stds=None, residual_mean=None, residual_std=None):
         """
         Args:
@@ -61,62 +61,13 @@ class RobustPrecipitationZScoreDataset(Dataset):
             self.residual_mean = residual_mean
             self.residual_std = residual_std
 
-
-    def _compute_normalization_params(self):
-        """
-        遍历所有文件，计算各变量及 acpcp 残差的均值与标准差。
-        对于 acpcp 变量，先执行异常值处理（clip 到 [0,999]）。
-        """
-        data_dict = {var: [] for var in self.variables}  # 存放每个变量的所有样本（展平后的一维数组）
-        residual_list = []
+        # 预先处理并缓存所有样本
+        self.samples = []
         for file in self.file_list:
-            ds = xr.open_dataset(file)
-            # 处理各变量
-            for var in self.variables:
-                if var not in ds:
-                    ds.close()
-                    raise ValueError(f"文件 {file} 缺少变量 {var}")
-                arr = ds[var].values  # shape: (224,224)
-                arr = np.nan_to_num(arr, nan=0.0)
-                if var == "acpcp":
-                    # 对降水数据进行异常值处理：clip 到 [0,999]
-                    arr = np.clip(arr, 0, 999)
-                data_dict[var].append(arr.flatten())
-            # 计算 acpcp 的残差：先生成 low-res 版本，再 residual = fine - coarse
-            fine = torch.tensor(ds["acpcp"].values, dtype=torch.float32)
-            fine = torch.clamp(fine, 0, 999)  # 异常值处理
-            # 扩展维度为 (1,1,224,224)
-            fine_unsq = fine.unsqueeze(0).unsqueeze(0)
-            # 下采样到 input_size，再上采样回 target_size（保持原始网格）
-            downsampled = F.interpolate(fine_unsq, size=self.input_size, mode="bicubic", align_corners=False)
-            coarse = F.interpolate(downsampled, size=self.target_size, mode="bicubic", align_corners=False)
-            residual = fine_unsq - coarse  # shape (1,1,224,224)
-            residual_np = residual.squeeze().numpy()  # shape (224,224)
-            residual_list.append(residual_np.flatten())
-            ds.close()
+            sample = self._process_file(file)
+            self.samples.append(sample)
 
-        # 计算各变量均值和标准差
-        computed_norm_means = {}
-        computed_norm_stds = {}
-        for var in self.variables:
-            all_data = np.concatenate(data_dict[var], axis=0)
-            computed_norm_means[var] = float(np.mean(all_data))
-            computed_norm_stds[var] = float(np.std(all_data))
-        # 计算残差均值和标准差
-        all_residual = np.concatenate(residual_list, axis=0)
-        computed_residual_mean = float(np.mean(all_residual))
-        computed_residual_std = float(np.std(all_residual))
-        return computed_norm_means, computed_norm_stds, computed_residual_mean, computed_residual_std
-
-    def _zscore(self, tensor, mean, std):
-        """对 tensor 进行 Z-Score 标准化： (x - mean) / std"""
-        return (tensor - mean) / std
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, idx):
-        file_path = self.file_list[idx]
+    def _process_file(self, file_path):
         ds = xr.open_dataset(file_path)
 
         # 读取所有变量，均假设 shape 为 (224,224)，并转换为 tensor（添加 channel 维度）
@@ -194,6 +145,64 @@ class RobustPrecipitationZScoreDataset(Dataset):
         }
 
         return sample
+
+
+    def _compute_normalization_params(self):
+        """
+        遍历所有文件，计算各变量及 acpcp 残差的均值与标准差。
+        对于 acpcp 变量，先执行异常值处理（clip 到 [0,999]）。
+        """
+        data_dict = {var: [] for var in self.variables}  # 存放每个变量的所有样本（展平后的一维数组）
+        residual_list = []
+        for file in self.file_list:
+            ds = xr.open_dataset(file)
+            # 处理各变量
+            for var in self.variables:
+                if var not in ds:
+                    ds.close()
+                    raise ValueError(f"文件 {file} 缺少变量 {var}")
+                arr = ds[var].values  # shape: (224,224)
+                arr = np.nan_to_num(arr, nan=0.0)
+                if var == "acpcp":
+                    # 对降水数据进行异常值处理：clip 到 [0,999]
+                    arr = np.clip(arr, 0, 999)
+                data_dict[var].append(arr.flatten())
+            # 计算 acpcp 的残差：先生成 low-res 版本，再 residual = fine - coarse
+            fine = torch.tensor(ds["acpcp"].values, dtype=torch.float32)
+            fine = torch.clamp(fine, 0, 999)  # 异常值处理
+            # 扩展维度为 (1,1,224,224)
+            fine_unsq = fine.unsqueeze(0).unsqueeze(0)
+            # 下采样到 input_size，再上采样回 target_size（保持原始网格）
+            downsampled = F.interpolate(fine_unsq, size=self.input_size, mode="bicubic", align_corners=False)
+            coarse = F.interpolate(downsampled, size=self.target_size, mode="bicubic", align_corners=False)
+            residual = fine_unsq - coarse  # shape (1,1,224,224)
+            residual_np = residual.squeeze().numpy()  # shape (224,224)
+            residual_list.append(residual_np.flatten())
+            ds.close()
+
+        # 计算各变量均值和标准差
+        computed_norm_means = {}
+        computed_norm_stds = {}
+        for var in self.variables:
+            all_data = np.concatenate(data_dict[var], axis=0)
+            computed_norm_means[var] = float(np.mean(all_data))
+            computed_norm_stds[var] = float(np.std(all_data))
+        # 计算残差均值和标准差
+        all_residual = np.concatenate(residual_list, axis=0)
+        computed_residual_mean = float(np.mean(all_residual))
+        computed_residual_std = float(np.std(all_residual))
+        return computed_norm_means, computed_norm_stds, computed_residual_mean, computed_residual_std
+
+    def _zscore(self, tensor, mean, std):
+        """对 tensor 进行 Z-Score 标准化： (x - mean) / std"""
+        return (tensor - mean) / std
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_path = self.file_list[idx]
+        return self.samples[idx]
 
     def _generate_lowres(self, fine_precip):
         """改进的下采样方法，保持边缘信息"""

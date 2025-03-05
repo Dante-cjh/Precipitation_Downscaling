@@ -190,7 +190,7 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         max_epochs=1000,
         accelerator="gpu",
-        devices=[0],
+        devices=[7],
         callbacks=[early_stop_callback, checkpoint_callback, save_every_n_epochs_callback],
         precision="16-mixed",                      # 使用 16-mixed 精度
         accumulate_grad_batches=8,

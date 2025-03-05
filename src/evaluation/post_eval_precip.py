@@ -225,5 +225,5 @@ def main_evaluation(path):
     print("\nAll images saved and metrics computed successfully.")
 
 if __name__ == "__main__":
-    path = "../../predictions/diffusion_unet"
+    path = "../../predictions/diffusion_unet_v2_new"
     main_evaluation(path)
