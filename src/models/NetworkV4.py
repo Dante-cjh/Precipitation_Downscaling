@@ -15,6 +15,7 @@
 import numpy as np
 import torch
 from torch.nn.functional import silu
+import torch.nn.functional as F
 
 #----------------------------------------------------------------------------
 # Unified routine for initializing weights and biases.
@@ -168,82 +169,83 @@ class AttentionOp(torch.autograd.Function):
         dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
         return dq, dk
 
-#----------------------------------------------------------------------------
-# Meteorological Condition Encoder
-
-class MeteoEncoder(torch.nn.Module):
-    """Encodes meteorological variables (例如湿度、温度、风速、陆海分界等)"""
-    def __init__(self, in_channels=6, emb_dim=256):
+# 新增气象注意力模块
+class MeteoAttentionModule(torch.nn.Module):
+    def __init__(self, precip_channels=1, meteo_channels=6, out_channels=64, downsample_factor=4):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            Conv2d(in_channels, 128, kernel=3, down=True),
-            GroupNorm(128),
-            torch.nn.SiLU(),
-            Conv2d(128, emb_dim, kernel=3, down=True),
-            GroupNorm(emb_dim),
-            torch.nn.SiLU()
+        # 卷积层提取特征
+        self.precip_conv = torch.nn.Conv2d(precip_channels, out_channels, kernel_size=3, padding=1)
+        self.meteo_conv = torch.nn.Conv2d(meteo_channels, out_channels, kernel_size=3, padding=1)
+        # 交叉注意力
+        self.cross_attn = torch.nn.MultiheadAttention(embed_dim=out_channels, num_heads=4)
+        # 归一化
+        self.norm = torch.nn.GroupNorm(8, out_channels)
+        self.downsample_factor = downsample_factor
+        self.upsample = torch.nn.Upsample(scale_factor=downsample_factor, mode='bilinear')
+
+    def forward(self, coarse_precip, meteo_conditions):
+        # 输入形状：coarse_precip [B, 1, H, W], meteo_conditions [B, 6, H, W]
+        B, _, H, W = coarse_precip.shape
+
+        # 下采样（可选，根据计算资源调整）
+        coarse_precip_down = F.interpolate(coarse_precip, scale_factor=1 / self.downsample_factor, mode='bilinear')
+        meteo_conditions_down = F.interpolate(meteo_conditions, scale_factor=1 / self.downsample_factor,
+                                              mode='bilinear')
+
+        # 特征提取
+        query = self.precip_conv(coarse_precip_down)  # [B, 64, H/4, W/4]
+        key_value = self.meteo_conv(meteo_conditions_down)  # [B, 64, H/4, W/4]
+
+        # 展平为序列以适配 MultiheadAttention
+        query = query.view(B, 64, -1).permute(2, 0, 1)  # [H/4*W/4, B, 64]
+        key = key_value.view(B, 64, -1).permute(2, 0, 1)  # [H/4*W/4, B, 64]
+        value = key_value.view(B, 64, -1).permute(2, 0, 1)  # [H/4*W/4, B, 64]
+
+        # 交叉注意力计算
+        attn_output, _ = self.cross_attn(query, key, value)
+
+        # 恢复空间形状并上采样
+        attn_output = attn_output.permute(1, 2, 0).view(B, 64, H // self.downsample_factor, W // self.downsample_factor)
+        attn_output = self.upsample(attn_output)  # [B, 64, H, W]
+
+        return self.norm(attn_output)
+
+# 新增残差注意力模块
+class ResidualAttentionBlock(torch.nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = Conv2d(channels, channels, kernel=3)
+        self.norm = GroupNorm(channels)
+        self.attn = torch.nn.Sequential(
+            Conv2d(channels, channels, kernel=1),
+            torch.nn.Sigmoid()
         )
 
-    def forward(self, meteo_conditions):
-        # 输入尺寸：[B, 6, H, W]，输出尺寸例如：[B, emb_dim, H/4, W/4]
-        return self.net(meteo_conditions)
-
-#----------------------------------------------------------------------------
-# Meteorological Cross-Attention Layer
-
-class CrossAttention(torch.nn.Module):
-    """将降水特征（查询）与气象条件（键、值）进行交叉注意力融合"""
-    def __init__(self, query_dim, context_dim, heads=4, dim_head=32):
-        super().__init__()
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.scale = dim_head ** -0.5
-
-        self.to_q = Conv2d(query_dim, hidden_dim, kernel=1)
-        self.to_kv = Conv2d(context_dim, 2 * hidden_dim, kernel=1)
-        self.to_out = Conv2d(hidden_dim, query_dim, kernel=1)
-
-    def forward(self, x, context):
-        b, c, h, w = x.shape
-        q = self.to_q(x)  # [B, hidden_dim, H, W]
-        k, v = self.to_kv(context).chunk(2, dim=1)  # 各为 [B, hidden_dim, H, W]
-
-        # 调整形状以便多头注意力计算
-        q = q.view(b, self.heads, -1, h * w).permute(0, 1, 3, 2)  # [B, heads, H*W, d_head]
-        k = k.view(b, self.heads, -1, h * w)                       # [B, heads, d_head, H*W]
-        v = v.view(b, self.heads, -1, h * w).permute(0, 1, 3, 2)     # [B, heads, H*W, d_head]
-
-        sim = torch.matmul(q, k) * self.scale  # [B, heads, H*W, H*W]
-        attn = sim.softmax(dim=-1)
-
-        out = torch.matmul(attn, v)  # [B, heads, H*W, d_head]
-        out = out.permute(0, 1, 3, 2).reshape(b, -1, h, w)
-        return self.to_out(out) + x  # 残差连接
+    def forward(self, x):
+        residual = x
+        x = self.conv(silu(self.norm(x)))
+        attn_weights = self.attn(x)
+        return residual * attn_weights + x
 
 #----------------------------------------------------------------------------
 # Unified U-Net Block integrating:
 # 1. 标准卷积残差模块
-# 2. 气象交叉注意力模块
+# 2. 残差注意力模块
 # 3. 通道注意力模块 (CAM) 和空间注意力模块 (SAM)
-# 4. 自注意力模块（可选）
+# 4. 气象注意力模块
+# 5. 自注意力模块（可选）
 class UNetBlock(torch.nn.Module):
     def __init__(self,
-                 in_channels, out_channels, emb_channels,
-                 up=False, down=False,
-                 attention=False, meteo_attention=False,
-                 num_heads=None, channels_per_head=64,
-                 dropout=0, skip_scale=1, eps=1e-5,
-                 resample_filter=[1,1], resample_proj=False,
-                 adaptive_scale=True,
+                 in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
+                 num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
+                 resample_filter=[1,1], resample_proj=False, adaptive_scale=True,
                  init=dict(), init_zero=dict(init_weight=0), init_attn=None,
-                 use_cam=True, use_sam=True,
-                 meteo_context_dim=None # 新增参数
+                 use_cam=True, use_sam=True
                  ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.emb_channels = emb_channels
-        self.meteo_attention = meteo_attention
         self.use_cam = use_cam
         self.use_sam = use_sam
         # 自注意力头数
@@ -257,19 +259,7 @@ class UNetBlock(torch.nn.Module):
         self.affine = Linear(emb_channels, out_channels * (2 if adaptive_scale else 1), **init)
         self.norm1 = GroupNorm(out_channels, eps=eps)
         self.conv1 = Conv2d(out_channels, out_channels, kernel=3, **init_zero)
-
-        # 气象交叉注意力模块
-        if self.meteo_attention:
-            # 如果未传入，则默认为 emb_channels
-            meteo_context_dim = meteo_context_dim or emb_channels
-            self.meteo_attn = CrossAttention(query_dim=out_channels, context_dim=meteo_context_dim, heads=4, dim_head=32)
-
-        # 残差分支调整（当输入输出通道不匹配或需要采样时）
-        if out_channels != in_channels or up or down:
-            kernel = 1 if resample_proj or (out_channels != in_channels) else 0
-            self.skip = Conv2d(in_channels, out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, **init)
-        else:
-            self.skip = None
+        self.residual_attention = ResidualAttentionBlock(out_channels)
 
         # 通道注意力 (CAM) 和空间注意力 (SAM)
         if self.use_cam:
@@ -283,8 +273,7 @@ class UNetBlock(torch.nn.Module):
             self.qkv = Conv2d(out_channels, out_channels * 3, kernel=1, **(init_attn if init_attn is not None else init))
             self.proj = Conv2d(out_channels, out_channels, kernel=1, **init_zero)
 
-    def forward(self, x, emb, meteo_context=None):
-        orig = x
+    def forward(self, x, emb):
         x = self.conv0(silu(self.norm0(x)))
 
         params = self.affine(emb).unsqueeze(2).unsqueeze(3).to(x.dtype)
@@ -295,12 +284,9 @@ class UNetBlock(torch.nn.Module):
             x = silu(self.norm1(x + params))
 
         x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
-        x = x + (self.skip(orig) if self.skip is not None else orig)
-        x = x * self.skip_scale
 
-        # 先进行气象交叉注意力
-        if self.meteo_attention and meteo_context is not None:
-            x = self.meteo_attn(x, context=meteo_context) + x
+        # 添加残差注意力
+        x = self.residual_attention(x)
 
         # 再应用通道注意力和空间注意力（顺序可根据实验调优）
         if self.use_cam:
@@ -314,7 +300,8 @@ class UNetBlock(torch.nn.Module):
             w = AttentionOp.apply(q, k)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
-            x = x * self.skip_scale
+
+        x = x * self.skip_scale
 
         return x
 
@@ -339,12 +326,11 @@ class PositionalEmbedding(torch.nn.Module):
 # Reimplementation of the ADM architecture with the enhanced attention modules.
 class UNet(torch.nn.Module):
     def __init__(self,
-                 img_resolution,           # 输入/输出图像分辨率，例如 (224, 224)
-                 in_channels,              # 降水输入通道数
-                 out_channels,             # 输出通道数
-                 label_dim=0,              # 类别标签维度
-                 augment_dim=0,            # 数据增强标签维度
-
+                 img_resolution,
+                 in_channels=2,  # [noised_residual_precip, coarse_precip]
+                 out_channels=1,
+                 label_dim=0,
+                 augment_dim=0,
                  model_channels=128,
                  channel_mult=[1,2,3,4],
                  channel_mult_emb=4,
@@ -353,48 +339,45 @@ class UNet(torch.nn.Module):
                  dropout=0.10,
                  label_dropout=0,
                  use_diffuse=True,
-                 use_meteo_attn=True,
-                 meteo_emb_dim=256,
                  use_cam=True,
-                 use_sam=True):
+                 use_sam=True,
+                 meteo_channels=64):
         super().__init__()
-        # 气象条件编码器
-        self.meteo_encoder = MeteoEncoder(in_channels=6, emb_dim=meteo_emb_dim)
 
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
         init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), init_bias=np.sqrt(1/3))
         init_zero = dict(init_mode='kaiming_uniform', init_weight=0, init_bias=0)
         block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout,
-                            init=init, init_zero=init_zero, use_cam=use_cam, use_sam=use_sam,
-                            meteo_context_dim=meteo_emb_dim)
+                            init=init, init_zero=init_zero, use_cam=use_cam, use_sam=use_sam)
 
-        # Mapping layers for噪声、标签、增强信息
         self.map_noise = PositionalEmbedding(num_channels=model_channels) if use_diffuse else None
         self.map_augment = Linear(augment_dim, model_channels, bias=False, **init_zero) if augment_dim else None
         self.map_layer0 = Linear(model_channels, emb_channels, **init)
         self.map_layer1 = Linear(emb_channels, emb_channels, **init)
         self.map_label = Linear(label_dim, emb_channels, bias=False, init_mode='kaiming_normal', init_weight=np.sqrt(label_dim)) if label_dim else None
 
-        assert len(img_resolution) == 2
+        self.meteo_attention = MeteoAttentionModule(precip_channels=1, meteo_channels=6, out_channels=meteo_channels)
+        # 输入融合层：将 2 + meteo_channels 调整为 model_channels
+        self.input_fusion = Conv2d(in_channels + meteo_channels, model_channels, kernel=3)
 
         # Encoder
         self.enc = torch.nn.ModuleDict()
-        cout = in_channels
+        cout = model_channels  # 输入已融合为 model_channels
         for level, mult in enumerate(channel_mult):
             resx = img_resolution[0] >> level
             resy = img_resolution[1] >> level
             if level == 0:
-                cin = cout
+                cin = cout  # 输入通道数为 model_channels
                 cout = model_channels * mult
                 self.enc[f'{resx}x{resy}_conv'] = Conv2d(cin, cout, kernel=3, **init)
             else:
-                self.enc[f'{resx}x{resy}_down'] = UNetBlock(cout, cout, down=True, **block_kwargs, meteo_attention=use_meteo_attn)
+                self.enc[f'{resx}x{resy}_down'] = UNetBlock(cout, cout, down=True, **block_kwargs)
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
                 attn_flag = resx in attn_resolutions
-                self.enc[f'{resx}x{resy}_block{idx}'] = UNetBlock(cin, cout, attention=attn_flag, **block_kwargs, meteo_attention=use_meteo_attn)
+                self.enc[f'{resx}x{resy}_block{idx}'] = UNetBlock(cin, cout, attention=attn_flag, **block_kwargs)
         skips = [block.out_channels for block in self.enc.values() if hasattr(block, 'out_channels')]
 
         # Decoder
@@ -403,24 +386,31 @@ class UNet(torch.nn.Module):
             resx = img_resolution[0] >> level
             resy = img_resolution[1] >> level
             if level == len(channel_mult) - 1:
-                self.dec[f'{resx}x{resy}_in0'] = UNetBlock(cout, cout, attention=True, **block_kwargs, meteo_attention=use_meteo_attn)
-                self.dec[f'{resx}x{resy}_in1'] = UNetBlock(cout, cout, **block_kwargs, meteo_attention=use_meteo_attn)
+                self.dec[f'{resx}x{resy}_in0'] = UNetBlock(cout, cout, attention=True, **block_kwargs)
+                self.dec[f'{resx}x{resy}_in1'] = UNetBlock(cout, cout, **block_kwargs)
             else:
-                self.dec[f'{resx}x{resy}_up'] = UNetBlock(cout, cout, up=True, **block_kwargs, meteo_attention=use_meteo_attn)
+                self.dec[f'{resx}x{resy}_up'] = UNetBlock(cout, cout, up=True, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
                 attn_flag = resx in attn_resolutions
-                self.dec[f'{resx}x{resy}_block{idx}'] = UNetBlock(cin, cout, attention=attn_flag, **block_kwargs, meteo_attention=use_meteo_attn)
+                self.dec[f'{resx}x{resy}_block{idx}'] = UNetBlock(cin, cout, attention=attn_flag, **block_kwargs)
         self.out_norm = GroupNorm(cout)
         self.out_conv = Conv2d(cout, out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels=None, class_labels=None,
-                augment_labels=None, meteo_conditions=None):
-        # 气象条件编码（输入形状例如：[B,6,H,W]）
-        meteo_emb = self.meteo_encoder(meteo_conditions) if meteo_conditions is not None else None
+        self.multiscale_fusion = Conv2d(2, 1, kernel=3)
 
-        # Mapping for embedding
+    def forward(self, x, noise_labels=None, class_labels=None,
+                augment_labels=None, meteo_conditions=None, multi_scale_residuals=None):
+        # x: [B, 2, H, W]，即 [noised_residual_precip, coarse_precip]
+        coarse_precip = x[:, 1:2, :, :]  # [B, 1, H, W]
+        meteo_features = self.meteo_attention(coarse_precip, meteo_conditions)  # [B, 64, H, W]
+
+        # 在输入处融合 meteo_features
+        x = torch.cat([x, meteo_features], dim=1)  # [B, 66, H, W]
+        x = self.input_fusion(x)  # [B, model_channels, H, W]
+
+        # Embedding
         emb = torch.zeros(1, self.map_layer1.in_features, device=x.device)
         if self.map_label is not None:
             tmp = class_labels
@@ -439,21 +429,19 @@ class UNet(torch.nn.Module):
         # Encoder
         skips = []
         for key, block in self.enc.items():
-            if isinstance(block, UNetBlock):
-                x = block(x, emb, meteo_context=meteo_emb)
-            else:
-                x = block(x)
+            x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
             skips.append(x)
 
         # Decoder
         for key, block in self.dec.items():
-            # 当分辨率不匹配时，融合跳跃连接
             if x.shape[1] != block.in_channels:
                 x = torch.cat([x, skips.pop()], dim=1)
-            if isinstance(block, UNetBlock):
-                x = block(x, emb, meteo_context=meteo_emb)
-            else:
-                x = block(x)
+            x = block(x, emb)
+
+        if multi_scale_residuals is not None:
+            fused_residual = self.multiscale_fusion(torch.cat(multi_scale_residuals, dim=1))
+            x = x + fused_residual
+
         x = self.out_conv(silu(self.out_norm(x)))
         return x
 
@@ -483,8 +471,6 @@ class EDMPrecond(torch.nn.Module):
         self.sigma_data = sigma_data
 
         # 保证气象注意力相关参数正确传递
-        model_kwargs['use_meteo_attn'] = model_kwargs.get('use_meteo_attn', True)
-        model_kwargs['meteo_emb_dim'] = model_kwargs.get('meteo_emb_dim', 256)
         model_kwargs['use_cam'] = model_kwargs.get('use_cam', True)
         model_kwargs['use_sam'] = model_kwargs.get('use_sam', True)
 
@@ -493,7 +479,7 @@ class EDMPrecond(torch.nn.Module):
             out_channels=out_channels, label_dim=label_dim, **model_kwargs)
 
     def forward(self, x, sigma, condition_img=None, class_labels=None,
-                force_fp32=True, meteo_conditions=None, **model_kwargs):
+                force_fp32=True, meteo_conditions=None, multi_scale_residuals=None, **model_kwargs):
         if condition_img is not None:
             in_img = torch.cat([x, condition_img], dim=1)
         else:
@@ -509,13 +495,11 @@ class EDMPrecond(torch.nn.Module):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        F_x = self.model((c_in * in_img).to(dtype),
-                         noise_labels=c_noise.flatten(),
-                         class_labels=class_labels,
-                         meteo_conditions=meteo_conditions,
-                         **model_kwargs).to(dtype)
-        assert F_x.dtype == dtype
+        F_x = self.model(x=(c_in * in_img).to(dtype), noise_labels=c_noise.flatten(),
+                         class_labels=class_labels, meteo_conditions=meteo_conditions,
+                         multi_scale_residuals=multi_scale_residuals)
         D_x = c_skip * x + c_out * F_x
+
         return D_x
 
     def round_sigma(self, sigma):

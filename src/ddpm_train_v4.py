@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 import torchmetrics
 from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from src.dataset.ddpm_dataset_v2 import RobustPrecipitationDataModule
+from src.dataset.ddpm_dataset_v3 import RobustPrecipitationDataModule
 from src.models import NetworkV4
 
 class SaveEveryNEpochs(pl.callbacks.Callback):
@@ -26,35 +26,26 @@ class SaveEveryNEpochs(pl.callbacks.Callback):
 # =============================================================================
 # 1. 定义损失函数 EDMLoss（与原始实现一致）
 # =============================================================================
+# EDM 损失函数
 class EDMLoss:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=1.0):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
-    def __call__(self, net, images, conditional_img=None, labels=None, augment_pipe=None, rainfall_mask=None, meteo_conditions=None):
-        # 生成噪声尺度 sigma
+    def __call__(self, net, images, conditional_img=None, labels=None, augment_pipe=None, rainfall_mask=None, meteo_conditions=None, multi_scale_residuals=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-
-        # EDM损失计算
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        if augment_pipe is not None:
-            y, augment_labels = augment_pipe(images)
-        else:
-            y, augment_labels = images, None
-        # 加入噪声后前向计算
+        y, augment_labels = (images, None) if augment_pipe is None else augment_pipe(images)
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, conditional_img, labels, augment_labels=augment_labels, meteo_conditions=meteo_conditions)
+        D_yn = net(y + n, sigma, conditional_img, labels, augment_labels=augment_labels, meteo_conditions=meteo_conditions, multi_scale_residuals=multi_scale_residuals)
         loss = weight * ((D_yn - y) ** 2)
-
-        # 计算加权损失
         if rainfall_mask is not None:
-            loss = loss * (1 + rainfall_mask)  # 对高降水区域赋予更高权重
-
+            loss = loss * (1 + rainfall_mask)
         return loss
 
-
+# 极端值 MAE 指标
 class ExtremeMAE(torchmetrics.Metric):
     def __init__(self, threshold=50.0):
         super().__init__()
@@ -63,16 +54,13 @@ class ExtremeMAE(torchmetrics.Metric):
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, preds, target):
-        # 过滤出超过阈值的样本
         mask = target >= self.threshold
         extreme_preds = preds[mask]
         extreme_target = target[mask]
-        # 累计绝对误差和样本数
         self.errors += torch.sum(torch.abs(extreme_preds - extreme_target))
         self.total += extreme_target.numel()
 
     def compute(self):
-        # 计算平均，若无样本返回NaN
         return self.errors / self.total if self.total > 0 else torch.tensor(float('nan'))
 
 # =============================================================================
@@ -93,10 +81,9 @@ class DiffusionLightningModule(pl.LightningModule):
         # 注意：img_resolution 为 (224, 224)，in_channels=8 （7个条件通道+1个目标残差通道作为条件输入）
         self.model = NetworkV4.EDMPrecond(
             img_resolution=(224, 224),
-            in_channels=8,  # 7 通道条件数据 + 1 通道降水残差（作为条件输入）
-            out_channels=1,
-            use_meteo_attn=True,
-            meteo_emb_dim=256,
+            in_channels=2,  # coarse_precip + residual_precip
+            out_channels=1, # 输出降水
+            label_dim=0,
             use_cam=True,
             use_sam=True
         )
@@ -118,14 +105,9 @@ class DiffusionLightningModule(pl.LightningModule):
         # 反归一化
         self.inverse_normalize_residual = lambda residual_norm: ((residual_norm * self.residual_std) + self.residual_mean)
 
-
     def _prepare_inputs(self, batch):
-        """整合多模态输入为7通道张量"""
-        return torch.cat([
-            batch['conditions']['coarse_precip'],  # [B,1,H,W] 低分辨率降水
-            batch['conditions']['dynamic'],  # [B,4,H,W] (r2, t, u10, v10)
-            batch['conditions']['static'],  # [B,2,H,W] (lsm, z)
-        ], dim=1)  # -> [B,8,H,W]
+        # 只返回 coarse_precipitation 作为主要输入
+        return batch['conditions']['coarse_precip']  # [B, 1, H, W]
 
     def _prepare_meteo_conditions(self, batch):
         """单独获取所有气象条件数据"""
@@ -134,24 +116,30 @@ class DiffusionLightningModule(pl.LightningModule):
             batch['conditions']['static'],  # [B,2,H,W] (lsm, z)
         ], dim=1)
 
-
-    def forward(self, x, sigma, conditional_img, labels=None):
-        return self.model(x, sigma, conditional_img, labels)
-
+    def forward(self, x, sigma, conditional_img, labels=None, meteo_conditions=None, multi_scale_residuals=None):
+        return self.model(x, sigma, conditional_img, labels, meteo_conditions=meteo_conditions,
+                          multi_scale_residuals=multi_scale_residuals)
 
     def training_step(self, batch, batch_idx):
         # batch 中包含 "inputs" (7 通道条件数据) 和 "targets" (1 通道标准化后的残差)
         # 准备输入并计算损失
         inputs = self._prepare_inputs(batch)
         meteo_conditions = self._prepare_meteo_conditions(batch)
-        loss = self.loss_fn(
-            net=self.model,
-            images=batch["target"],
-            conditional_img=inputs,
-            rainfall_mask=batch["rainfall_mask"],
-            meteo_conditions=meteo_conditions
-        ).mean()
+        multi_scale_residuals = batch['multi_scale_residuals']
 
+        loss = 0
+        for scale, residual in enumerate(multi_scale_residuals):
+            scale_loss = self.loss_fn(
+                net=self.model,
+                images=residual,
+                conditional_img=inputs,
+                rainfall_mask=batch["rainfall_mask"],
+                meteo_conditions=meteo_conditions,
+                multi_scale_residuals=multi_scale_residuals
+            ).mean()
+            loss += scale_loss * (0.5 ** scale)  # 不同尺度加权
+
+        loss /= len(multi_scale_residuals)
         self.train_loss_accum.append(loss.detach())
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
@@ -164,31 +152,25 @@ class DiffusionLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs = self._prepare_inputs(batch)
-        # 使用模型预测
-        pred = self._get_pred(inputs, batch['target'])
+        meteo_conditions = self._prepare_meteo_conditions(batch)
+        multi_scale_residuals = batch['multi_scale_residuals']
+        pred = self._get_pred(inputs, batch['target'], meteo_conditions, multi_scale_residuals)
 
-        # 获取标准化后的真实图像
         fine_true = batch["metadata"]["fine_precip"]
         fine_pred = batch['metadata']['coarse_precip'] + self.inverse_normalize_residual(pred)
 
-        # 检查是否存在 NaN 或 Inf 值并进行修复
-        if torch.isnan(fine_true).any() or torch.isinf(fine_true).any():
-            fine_true = torch.clamp(fine_true, min=0.0)  # 修复 NaN/Inf 值
-        if torch.isnan(fine_pred).any() or torch.isinf(fine_pred).any():
-            fine_pred = torch.clamp(fine_pred, min=0.0)  # 修复 NaN/Inf 值
+        # 修复 NaN/Inf 值
+        fine_true = torch.clamp(fine_true, min=0.0)
+        fine_pred = torch.clamp(fine_pred, min=0.0)
 
-        # 计算评估指标
         data_min = fine_true.min()
         data_max = fine_true.max()
+        dynamic_range = max(data_max.item() - data_min.item(), 1e-6)
 
-        # 检查图像范围，防止除零错误
-        dynamic_range = max(data_max.item() - data_min.item(), 1e-6)  # 防止 dynamic_range 为零
+        mse_val = F.mse_loss(fine_pred, fine_true)
+        psnr_val = peak_signal_noise_ratio(fine_pred, fine_true, data_range=dynamic_range)
+        ssim_val = structural_similarity_index_measure(fine_pred, fine_true, data_range=dynamic_range)
 
-        mse_val = F.mse_loss(fine_pred, fine_true)  # MSE
-        psnr_val = peak_signal_noise_ratio(fine_pred, fine_true, data_range=dynamic_range)  # PSNR
-        ssim_val = structural_similarity_index_measure(fine_pred, fine_true, data_range=dynamic_range)  # SSIM
-
-        # 日志记录
         self.log("val_loss", mse_val, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_mse", mse_val, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_psnr", psnr_val, prog_bar=True, on_step=False, on_epoch=True)
@@ -197,14 +179,13 @@ class DiffusionLightningModule(pl.LightningModule):
         if not hasattr(self, '_val_outputs'):
             self._val_outputs = []
         self._val_outputs.append({'pred': fine_pred.detach(), 'target': fine_true.detach()})
-
         return mse_val
 
     def on_validation_epoch_end(self):
         if hasattr(self, '_val_outputs') and len(self._val_outputs) > 0:
             all_preds = torch.cat([x['pred'] for x in self._val_outputs], dim=0)
             all_targets = torch.cat([x['target'] for x in self._val_outputs], dim=0)
-            overall_mse = F.mse_loss(all_preds, all_targets)  # 计算整个验证集的 MSE
+            overall_mse = F.mse_loss(all_preds, all_targets)
             self.log("epoch_val_mse", overall_mse, prog_bar=True)
             self._val_outputs = []
 
@@ -220,17 +201,14 @@ class DiffusionLightningModule(pl.LightningModule):
 
         return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
 
-    def _get_pred(self, image_input, image_target):
-        """
-        模拟采样过程：生成噪声尺度 sigma，再对 (target+n) 调用模型得到预测结果。
-        """
+    def _get_pred(self, image_input, image_target, meteo_conditions, multi_scale_residuals):
         rnd_normal = torch.randn([image_target.shape[0], 1, 1, 1], device=image_target.device)
         sigma = (rnd_normal * self.loss_fn.P_std + self.loss_fn.P_mean).exp()
-        y = image_target  # 使用真实目标
-        n = torch.randn_like(y) * sigma  # 添加噪声
-        D_yn = self.model(y + n, sigma, image_input, None)  # 前向传播
+        y = image_target
+        n = torch.randn_like(y) * sigma
+        D_yn = self.model(y + n, sigma, image_input, None, meteo_conditions=meteo_conditions,
+                          multi_scale_residuals=multi_scale_residuals)
         return D_yn
-
 
 # =============================================================================
 # 3. 主函数，使用 Lightning Trainer 进行训练，并添加 EarlyStopping 回调（patience=10）
@@ -254,7 +232,7 @@ if __name__ == "__main__":
 
     # EarlyStopping 回调（监控 "val_loss"，patience 设为 10）
     early_stop_callback = pl.callbacks.EarlyStopping(monitor="val_loss", patience=20, mode="min")
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", dirpath="../models/unet_diffusion_v1/", filename='model-{epoch:02d}-{val_loss:.2f}', save_top_k=1, mode="min")
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_loss", dirpath="../models/unet_diffusion_v4/", filename='model-{epoch:02d}-{val_loss:.2f}', save_top_k=1, mode="min")
     save_every_n_epochs_callback = SaveEveryNEpochs(save_dir="../models/unet_diffusion_v4/", save_every_n_epochs=20)
 
     # Learning rate scheduler and monitor
@@ -266,7 +244,7 @@ if __name__ == "__main__":
         precision="16-mixed",
         accumulate_grad_batches=8,
         log_every_n_steps=10,
-        default_root_dir="../logs/unet_diffusion/"
+        default_root_dir="../logs/unet_diffusion_v4/"
     )
     trainer.fit(model, dm)
 
@@ -274,4 +252,4 @@ if __name__ == "__main__":
     best_model_path = checkpoint_callback.best_model_path
     if best_model_path:
         best_model = DiffusionLightningModule.load_from_checkpoint(best_model_path)
-        torch.save(best_model.model.state_dict(), "../models/unet_diffusion/best_model.pt")
+        torch.save(best_model.model.state_dict(), "../models/unet_diffusion_v4/best_model.pt")
