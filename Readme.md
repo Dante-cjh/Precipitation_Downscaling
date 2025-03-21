@@ -1,5 +1,15 @@
 # This is the Precipitation Downscaling Recent Model for the project
 
-*不要外传，不要外传，不要外传*
+## model
+### DeepSD
+### FSRCNN
+### Conditional GAN + CBAM
+### Conditional VAE
+### Conditional UNet
+### DDPM
+### iDDPM
+### EDM
 
-因为实验还没弄完，paper还没发出来
+## Dataset
+*ERA5* for coarse resolution
+全球天气模式产品（V4.0）*CMA-GFS* for fine resolution
